@@ -301,8 +301,10 @@ def check_live(session: requests.Session, host: str) -> Optional[Tuple[str, int]
         try:
             resp = session.head(url, timeout=session.request_timeout, allow_redirects=True)
             code = resp.status_code
-            if code == 405 or code >= 400:
-                # Some servers dislike HEAD - retry with a quick GET.
+            if code in (405, 501):
+                # Only retry with GET when HEAD itself is unsupported; a normal
+                # 4xx response (404/403/...) already means the host is reachable
+                # or the path is simply missing - no point in doubling traffic.
                 resp = session.get(url, timeout=session.request_timeout,
                                    allow_redirects=True, stream=True)
                 code = resp.status_code
