@@ -1,48 +1,85 @@
+#!/usr/bin/env python3
+"""
+BackupFinder - Ultimate Bug Bounty Recon + Backup File Discovery Tool
+=====================================================================
+
+Features
+--------
+- Deep subdomain enumeration (HTML + JS + CSP recursive extraction)
+- Live-host probing (HTTP/HTTPS with status codes)
+- High-performance backup file discovery (HEAD + partial GET validation)
+- Smart "soft 404" filtering, IP-aware URL generation
+- User-tunable concurrency via `-threads`
+
+Modes
+-----
+  -t   <target>        Full pipeline for a single domain/IP
+  -l   <file>          Full pipeline for a list of domains/IPs
+  -ld  <file>          Direct backup scan (skip subdomain phase)
+  -sub <target|file>   Subdomain enumeration only (no backup phase)
+
+Example
+-------
+    python exp.py -t example.com -threads 100
+    python exp.py -l targets.txt -w wordlist.txt -threads 200
+    python exp.py -sub example.com              # subdomains only
+    python exp.py -sub targets.txt              # subdomains only (list)
+"""
+
+from __future__ import annotations
+
 import argparse
+import ipaddress
+import os
 import re
 import sys
-import requests
-from requests.exceptions import (
-    ConnectionError,
-    Timeout,
-    TooManyRedirects,
-    SSLError,
-    ChunkedEncodingError,
-)
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from colorama import Fore, Style, init
-import os
-from tqdm import tqdm
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-from urllib.parse import urljoin
 import warnings
-import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Iterable, List, Optional, Set, Tuple
+from urllib.parse import urljoin
 
-# Initialize colorama
-init(autoreset=True)
+import requests
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+from colorama import Fore, Style, init as colorama_init
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+from tqdm import tqdm
+from urllib3.util.retry import Retry
 
-# Ignore warnings
+# --------------------------------------------------------------------------- #
+# Global setup
+# --------------------------------------------------------------------------- #
+colorama_init(autoreset=True)
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-# Global session for subdomain/live checks (fast, no SSL verify)
-session = requests.Session()
-session.verify = False
-session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+try:  # pragma: no cover - depends on urllib3 version
+    from urllib3.exceptions import InsecureRequestWarning
 
-# ==================== BACKUP SCANNER CONFIG (10000x stronger) ====================
-BACKUP_EXTENSIONS = [
-    "",  # Important: allows exact filenames like .env, wp-config.php, dump.sql
-    ".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tar.bz2", ".gz", ".bz2",
-    ".sql", ".bak", ".old", ".backup", ".tmp", ".temp", ".db", ".txt",
-    ".php.bak", ".php.old", ".php~", ".asp.bak", ".aspx.bak", ".jsp.bak",
+    warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+except Exception:
+    pass
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Empty string allows literal filenames like `.env`, `wp-config.php`, `dump.sql`.
+BACKUP_EXTENSIONS: List[str] = [
+    "",
+    ".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".gz", ".bz2",
+    ".sql", ".sql.gz", ".sql.zip", ".bak", ".old", ".backup", ".tmp", ".temp",
+    ".db", ".sqlite", ".sqlite3", ".mdb", ".txt", ".log",
+    ".php.bak", ".php.old", ".php~", ".php.swp",
+    ".asp.bak", ".aspx.bak", ".jsp.bak",
     ".env.bak", ".config.bak", ".yaml.bak", ".yml.bak", ".json.bak",
-    ".swp", ".swo", ".inc.bak", ".cfm.bak"
+    ".swp", ".swo", ".inc.bak", ".cfm.bak", ".orig", ".save",
 ]
 
-# Strong built-in wordlist based on real HackerOne reports + common BB findings
-# (wp-config.php.bak, .env, database dumps, gitlab dumps, jenkins, etc.)
-DEFAULT_WORDS = [
+# Strong built-in wordlist drawn from real HackerOne / bug-bounty reports.
+DEFAULT_WORDS: List[str] = [
     "backup", "backups", "bak", "old", "archive", "dump", "sql", "db", "database",
     "config", "conf", "settings", "env", ".env", "wp-config", "wp-config.php",
     "application", "data", "test", "dev", "prod", "admin", "user", "users",
@@ -57,67 +94,101 @@ DEFAULT_WORDS = [
     "confidential", "testdb", "proddb", "stagingdb", "backup_1", "dump_2024",
     "export_2025", "site.zip", "www.zip", "public", "internal", "temp", "tmpdb",
     "redis", "mongo", "postgres", "gitlab", "jenkins", "confluence", "latest",
-    "current", "prod", "stage", "dev", "backup-latest", "full", "site"
+    "current", "stage", "backup-latest", "full", "site",
 ]
 
-# HTTP headers optimized for backup files (binary download)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Accept": "application/octet-stream,application/zip,application/x-rar-compressed,application/x-tar,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive"
+BASE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
 }
 
 PARTIAL_DOWNLOAD_SIZE = 1024
+MIN_SIZE_WHEN_KNOWN = 64  # Accept small files like tiny .env; reject empties.
 
-# Domain / IP validation
 DOMAIN_PATTERN = re.compile(
     r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})+(:\d{1,5})?$"
 )
 IP_PATTERN = re.compile(
-    r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(:\d{1,5})?$"
+    r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+    r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(:\d{1,5})?$"
 )
 
-def sanitize_domain(domain):
-    """Clean domain/IP (remove protocol, path, whitespace)"""
-    domain = domain.strip()
+
+# --------------------------------------------------------------------------- #
+# HTTP session
+# --------------------------------------------------------------------------- #
+def build_session(pool_size: int, timeout: float) -> requests.Session:
+    """Build a tuned requests.Session with retries + large connection pool."""
+    s = requests.Session()
+    s.verify = False
+    s.headers.update(BASE_HEADERS)
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=1,
+        backoff_factor=0.3,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=retry,
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.request_timeout = timeout  # type: ignore[attr-defined]
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Domain helpers
+# --------------------------------------------------------------------------- #
+def sanitize_domain(domain: str) -> str:
+    """Strip scheme, path, whitespace from a user-provided target."""
+    domain = (domain or "").strip()
     for prefix in ("https://", "http://"):
         if domain.lower().startswith(prefix):
             domain = domain[len(prefix):]
-    domain = domain.split("/")[0].strip()
-    return domain
+    return domain.split("/")[0].strip()
 
-def validate_domain(domain):
-    """Accept hostname or IPv4 (with optional port)"""
+
+def validate_domain(domain: str) -> bool:
     if not domain:
         return False
-    return DOMAIN_PATTERN.match(domain) is not None or IP_PATTERN.match(domain) is not None
+    return bool(DOMAIN_PATTERN.match(domain) or IP_PATTERN.match(domain))
 
-def is_ip_addr(addr):
-    """True if IPv4 (strip port if present)"""
+
+def is_ip_addr(addr: str) -> bool:
     try:
-        clean = addr.split(":")[0]
-        ipaddress.ip_address(clean)
+        ipaddress.ip_address(addr.split(":")[0])
         return True
     except ValueError:
         return False
 
-# ==================== SUBDOMAIN ENUM FUNCTIONS (from ex-js.py - optimized) ====================
-def fetch_url(domain):
-    for scheme in ["https", "http"]:
+
+# --------------------------------------------------------------------------- #
+# Subdomain enumeration
+# --------------------------------------------------------------------------- #
+def fetch_url(session: requests.Session, domain: str) -> Tuple[Optional[str], Optional[requests.Response]]:
+    for scheme in ("https", "http"):
         try:
             url = f"{scheme}://{domain}"
-            resp = session.get(url, timeout=8)
-            resp.raise_for_status()
-            return url, resp
-        except:
+            resp = session.get(url, timeout=session.request_timeout, allow_redirects=True)
+            if resp.status_code < 500:
+                return url, resp
+        except RequestException:
             continue
     return None, None
 
-def extract_js_links_and_inline(url, html):
-    soup = BeautifulSoup(html, 'html.parser')
-    js_links = set()
-    inline_scripts = []
+
+def extract_js_links_and_inline(url: str, html: str) -> Tuple[Set[str], List[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    js_links: Set[str] = set()
+    inline_scripts: List[str] = []
     for script in soup.find_all("script"):
         src = script.get("src")
         if src:
@@ -126,340 +197,495 @@ def extract_js_links_and_inline(url, html):
             inline_scripts.append(script.string)
     return js_links, inline_scripts
 
-def extract_subdomains(content, root_domain):
-    pattern = rf'https?://((?:[a-zA-Z0-9\-]+\.)+){re.escape(root_domain)}'
-    matches = re.findall(pattern, content)
-    return set(match.rstrip('.') for match in matches)
 
-def extract_csp_subdomains(headers, root_domain):
-    csp_subdomains = set()
-    pattern = rf'((?:[a-zA-Z0-9\-]+\.)+){re.escape(root_domain)}'
-    for header in ['Content-Security-Policy', 'Content-Security-Policy-Report-Only']:
+def extract_subdomain_prefixes(content: str, root_domain: str) -> Set[str]:
+    """Extract just the subdomain prefix (e.g. `api.v2` from `api.v2.example.com`)."""
+    pattern = rf"(?:https?://)?((?:[a-zA-Z0-9\-]+\.)+){re.escape(root_domain)}\b"
+    prefixes: Set[str] = set()
+    for match in re.findall(pattern, content):
+        prefix = match.rstrip(".")
+        if prefix and not prefix.startswith("."):
+            prefixes.add(prefix)
+    return prefixes
+
+
+def extract_csp_subdomains(headers, root_domain: str) -> Set[str]:
+    out: Set[str] = set()
+    for header in ("Content-Security-Policy", "Content-Security-Policy-Report-Only"):
         if header in headers:
-            csp_subdomains.update(re.findall(pattern, headers[header]))
-    return set(sub.rstrip('.') for sub in csp_subdomains)
+            out.update(extract_subdomain_prefixes(headers[header], root_domain))
+    return out
 
-def scan_single_js(js_url, root_domain):
+
+def scan_single_js(session: requests.Session, js_url: str, root_domain: str) -> Set[str]:
     try:
-        res = session.get(js_url, timeout=8)
-        return extract_subdomains(res.text, root_domain)
-    except:
+        res = session.get(js_url, timeout=session.request_timeout)
+        return extract_subdomain_prefixes(res.text, root_domain)
+    except RequestException:
         return set()
 
-def download_and_scan(js_urls, inline_scripts, html, headers, root_domain):
-    all_subdomains = set()
-    with ThreadPoolExecutor(max_workers=20) as executor:  # faster
-        futures = [executor.submit(scan_single_js, url, root_domain) for url in js_urls]
-        for future in as_completed(futures):
-            all_subdomains.update(future.result())
+
+def harvest_page(
+    session: requests.Session,
+    url: str,
+    response: requests.Response,
+    root_domain: str,
+    threads: int,
+) -> Set[str]:
+    """Extract every subdomain prefix from a page's HTML, JS and CSP headers."""
+    js_links, inline_scripts = extract_js_links_and_inline(url, response.text)
+    found: Set[str] = set()
+    found.update(extract_subdomain_prefixes(response.text, root_domain))
+    found.update(extract_csp_subdomains(response.headers, root_domain))
     for script in inline_scripts:
-        all_subdomains.update(extract_subdomains(script, root_domain))
-    all_subdomains.update(extract_subdomains(html, root_domain))
-    all_subdomains.update(extract_csp_subdomains(headers, root_domain))
-    return all_subdomains
+        found.update(extract_subdomain_prefixes(script, root_domain))
 
-def recursive_scan(domain, max_depth=10):
-    """Deep recursive JS + CSP + HTML subdomain enum (very fast)"""
-    visited = set()
-    found_subdomains = set()
+    if js_links:
+        with ThreadPoolExecutor(max_workers=min(threads, max(1, len(js_links)))) as ex:
+            futures = [ex.submit(scan_single_js, session, u, root_domain) for u in js_links]
+            for fut in as_completed(futures):
+                found.update(fut.result())
+    return found
 
-    def _scan(current_domain, depth):
-        if depth > max_depth or current_domain in visited:
-            return
-        visited.add(current_domain)
-        print(f"[Depth {depth}] Scanning: {current_domain}")
 
-        url, response = fetch_url(current_domain)
+def recursive_scan(
+    session: requests.Session,
+    domain: str,
+    threads: int,
+    max_depth: int = 3,
+    verbose: bool = True,
+) -> Set[str]:
+    """Fast, bounded recursive subdomain enumeration."""
+    visited: Set[str] = set()
+    found: Set[str] = set()
+
+    def _walk(host: str, depth: int) -> Set[str]:
+        if depth > max_depth or host in visited:
+            return set()
+        visited.add(host)
+        if verbose:
+            print(f"  [depth {depth}] {host}")
+
+        url, response = fetch_url(session, host)
         if not response:
-            return
+            return set()
+        return harvest_page(session, url, response, domain, threads)
 
-        js_links, inline_scripts = extract_js_links_and_inline(url, response.text)
-        subdomains = download_and_scan(js_links, inline_scripts, response.text, response.headers, domain)
-        found_subdomains.update(subdomains)
+    root_subs = _walk(domain, 0)
+    found.update(root_subs)
 
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = [executor.submit(_scan, f"{sub}.{domain}", depth + 1)
-                       for sub in subdomains if f"{sub}.{domain}" not in visited]
-            for _ in as_completed(futures):
-                pass
+    frontier = {f"{prefix}.{domain}" for prefix in root_subs}
+    for depth in range(1, max_depth + 1):
+        frontier = {h for h in frontier if h not in visited}
+        if not frontier:
+            break
+        next_frontier: Set[str] = set()
+        with ThreadPoolExecutor(max_workers=max(1, min(threads, len(frontier)))) as ex:
+            futures = {ex.submit(_walk, host, depth): host for host in frontier}
+            for fut in as_completed(futures):
+                new_prefixes = fut.result()
+                found.update(new_prefixes)
+                for p in new_prefixes:
+                    next_frontier.add(f"{p}.{domain}")
+        frontier = next_frontier
+    return found
 
-    _scan(domain, 0)
-    return found_subdomains
 
-def save_to_file(filepath, items):
-    with open(filepath, "w", encoding="utf-8") as f:
-        for item in sorted(items):
-            f.write(item + "\n")
-
-def get_live_full_urls(domains_list):
-    """Return clean live URLs (https:// or http://) - parallel + fast"""
-    live_urls = []
-
-    def check(sub):
-        for scheme in ["https", "http"]:
-            try:
-                url = f"{scheme}://{sub}"
-                resp = session.get(url, timeout=5)
-                if resp.status_code < 400:
-                    return url
-            except:
-                continue
-        return None
-
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        futures = [executor.submit(check, d) for d in domains_list]
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                live_urls.append(res)
-    return live_urls
-
-# ==================== BACKUP SCANNER FUNCTIONS (improved + IP friendly) ====================
-def is_valid_file(url):
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=7, stream=True, allow_redirects=True)
-        if response.status_code != 200:
-            return False
-
-        content_type = response.headers.get("Content-Type", "").lower()
-        raw_content_length = response.headers.get("Content-Length", "0")
+# --------------------------------------------------------------------------- #
+# Live-host probing
+# --------------------------------------------------------------------------- #
+def check_live(session: requests.Session, host: str) -> Optional[Tuple[str, int]]:
+    """Return (url, status) for the first scheme that responds with <400."""
+    for scheme in ("https", "http"):
+        url = f"{scheme}://{host}"
         try:
-            content_length = int(raw_content_length)
-        except (ValueError, TypeError):
-            content_length = 0
+            resp = session.head(url, timeout=session.request_timeout, allow_redirects=True)
+            code = resp.status_code
+            if code == 405 or code >= 400:
+                # Some servers dislike HEAD - retry with a quick GET.
+                resp = session.get(url, timeout=session.request_timeout,
+                                   allow_redirects=True, stream=True)
+                code = resp.status_code
+                resp.close()
+            if code < 400:
+                return url, code
+        except RequestException:
+            continue
+    return None
 
-        if "text/html" in content_type or content_length < 512:
+
+def probe_live_hosts(
+    session: requests.Session, hosts: Iterable[str], threads: int,
+) -> List[Tuple[str, int]]:
+    hosts = list(dict.fromkeys(hosts))
+    results: List[Tuple[str, int]] = []
+    if not hosts:
+        return results
+    with ThreadPoolExecutor(max_workers=max(1, min(threads, len(hosts)))) as ex:
+        futures = [ex.submit(check_live, session, h) for h in hosts]
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                        desc="Live probe", ncols=100, leave=False):
+            r = fut.result()
+            if r:
+                results.append(r)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Backup scanner
+# --------------------------------------------------------------------------- #
+def _looks_like_soft_404(chunk: bytes) -> bool:
+    snippet = chunk[:512].lower()
+    markers = (b"<html", b"<!doctype", b"not found", b"404", b"error page",
+               b"<title>404", b"page not found")
+    return any(m in snippet for m in markers)
+
+
+def is_valid_backup(session: requests.Session, url: str) -> bool:
+    """HEAD probe first, fall back to partial GET for final confirmation."""
+    try:
+        head = session.head(url, timeout=session.request_timeout,
+                            allow_redirects=True)
+    except RequestException:
+        return False
+
+    status = head.status_code
+    if status in (405, 501):
+        pass  # HEAD unsupported - fall through to GET.
+    elif status != 200:
+        return False
+    else:
+        ctype = head.headers.get("Content-Type", "").lower()
+        if "text/html" in ctype:
             return False
 
-        chunk = next(response.iter_content(chunk_size=PARTIAL_DOWNLOAD_SIZE), b"")
-        if chunk:
-            return True
-
-    except (ConnectionError, Timeout, SSLError, TooManyRedirects, ChunkedEncodingError, OSError):
+    try:
+        resp = session.get(url, headers={"Range": f"bytes=0-{PARTIAL_DOWNLOAD_SIZE - 1}"},
+                           timeout=session.request_timeout, stream=True,
+                           allow_redirects=True)
+    except RequestException:
         return False
-    except requests.RequestException:
-        return False
-    return False
 
-def generate_backup_urls(base_url, words, exts):
-    """Generate ultra-strong backup URLs. Handles domains + IPs correctly."""
+    try:
+        if resp.status_code not in (200, 206):
+            return False
+
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if "text/html" in ctype:
+            return False
+
+        try:
+            clen = int(resp.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            clen = 0
+        if clen and clen < MIN_SIZE_WHEN_KNOWN:
+            return False
+
+        chunk = next(resp.iter_content(chunk_size=PARTIAL_DOWNLOAD_SIZE), b"")
+        if not chunk:
+            return False
+        if _looks_like_soft_404(chunk):
+            return False
+        return True
+    finally:
+        resp.close()
+
+
+def generate_backup_urls(base_url: str, words: Iterable[str], exts: Iterable[str]) -> List[str]:
     base_url = base_url.rstrip("/")
-    urls = set()
-    hostname = base_url.split("://")[1].split("/")[0] if "://" in base_url else base_url
+    urls: Set[str] = set()
+    hostname = base_url.split("://", 1)[-1].split("/", 1)[0]
 
-    # Base name only for real domains (NOT IPs)
     if not is_ip_addr(hostname):
-        base_name = hostname.split(".")[0]
-        for ext in exts:
-            urls.add(f"{base_url}/{base_name}{ext}")
+        base_name = hostname.split(":")[0].split(".")[0]
+        if base_name:
+            for ext in exts:
+                urls.add(f"{base_url}/{base_name}{ext}")
 
-    # Wordlist (very strong)
     for word in words:
+        if not word:
+            continue
         urls.add(f"{base_url}/{word}")
         for ext in exts:
             urls.add(f"{base_url}/{word}{ext}")
 
-    return list(urls)
+    return sorted(urls)
 
-def process_backup_scan(live_url, words, exts):
-    """Scan one live base for backups (50 threads = very fast)"""
-    host = live_url.split("://")[-1].split("/")[0].replace(".", "_").replace(":", "_").replace("/", "_")
-    print(Style.BRIGHT + f"[*] Scanning backups → {live_url}")
+
+def _host_slug(live_url: str) -> str:
+    host = live_url.split("://", 1)[-1].split("/", 1)[0]
+    return host.replace(":", "_").replace(".", "_")
+
+
+def process_backup_scan(
+    session: requests.Session,
+    live_url: str,
+    words: List[str],
+    exts: List[str],
+    threads: int,
+    output_dir: str,
+) -> List[str]:
+    """Scan a single live host for backup files."""
+    slug = _host_slug(live_url)
+    print(Style.BRIGHT + f"[*] Scanning backups -> {live_url}")
 
     backup_urls = generate_backup_urls(live_url, words, exts)
-    valid_links = []
+    valid_links: List[str] = []
 
     try:
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            results = list(tqdm(
-                executor.map(is_valid_file, backup_urls),
-                total=len(backup_urls),
-                desc=f"Backups {host[:25]}",
-                ncols=100,
-                leave=False
-            ))
-            for url, is_valid in zip(backup_urls, results):
-                if is_valid:
-                    print(Fore.GREEN + f"[200] Valid backup: {url}")
-                    valid_links.append(url)
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(is_valid_backup, session, u): u
+                       for u in backup_urls}
+            progress = tqdm(as_completed(futures), total=len(futures),
+                            desc=f"Backups {slug[:24]}", ncols=100, leave=False)
+            for fut in progress:
+                url = futures[fut]
+                try:
+                    if fut.result():
+                        print(Fore.GREEN + f"[HIT] {url}")
+                        valid_links.append(url)
+                except Exception:  # noqa: BLE001 - defensive; worker errors shouldn't abort the run
+                    continue
     except KeyboardInterrupt:
-        print(Fore.YELLOW + "\n[!] Backup scan interrupted...")
+        print(Fore.YELLOW + "\n[!] Backup scan interrupted.")
 
     if valid_links:
-        file_name = f"{host}_valid_backup_links.txt"
-        try:
-            with open(file_name, "w", encoding="utf-8") as f:
-                for link in valid_links:
-                    f.write(link + "\n")
-            print(Fore.YELLOW + f"[*] {len(valid_links)} backups saved → {file_name}")
-        except Exception as e:
-            print(Fore.RED + f"[!] Save error {file_name}: {e}")
+        os.makedirs(output_dir, exist_ok=True)
+        file_name = os.path.join(output_dir, f"{slug}_valid_backup_links.txt")
+        with open(file_name, "w", encoding="utf-8") as f:
+            for link in sorted(valid_links):
+                f.write(link + "\n")
+        print(Fore.YELLOW + f"[*] {len(valid_links)} backups -> {file_name}")
     else:
-        print(Fore.RED + f"[*] No backups found for {live_url}")
+        print(Fore.RED + f"[-] No backups found for {live_url}")
+    return valid_links
 
-# ==================== DO SUBDOMAIN ENUM + LIVE (with folder save) ====================
-def do_subdomain_enum(domain):
-    """Phase 1 for one domain: sub enum + live check + save files"""
-    folder = domain.replace(":", "_")  # safe for port
-    if not os.path.exists(folder):
-        os.makedirs(folder)
 
-    print(f"[*] Starting DEEP subdomain scan for {domain}")
-    sub_prefixes = recursive_scan(domain)
+# --------------------------------------------------------------------------- #
+# Phase 1 orchestration
+# --------------------------------------------------------------------------- #
+def save_to_file(filepath: str, items: Iterable[str]) -> None:
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        for item in sorted(set(items)):
+            f.write(item + "\n")
 
-    full_subs = [f"{s}.{domain}" for s in sub_prefixes]
-    print(f"\n[+] Total Unique Subdomains: {len(full_subs)}")
+
+def do_subdomain_enum(
+    session: requests.Session,
+    domain: str,
+    threads: int,
+    output_dir: str,
+    max_depth: int,
+) -> List[str]:
+    """Phase 1: enumerate subdomains for one domain + probe live hosts."""
+    folder = os.path.join(output_dir, domain.replace(":", "_"))
+    os.makedirs(folder, exist_ok=True)
+
+    print(Fore.CYAN + f"[*] Deep subdomain scan: {domain}")
+    prefixes = recursive_scan(session, domain, threads=threads, max_depth=max_depth)
+
+    full_subs = sorted({f"{p}.{domain}" for p in prefixes})
+    print(Fore.CYAN + f"[+] Unique subdomains: {len(full_subs)}")
 
     sub_file = os.path.join(folder, f"{domain}_subdomains.txt")
     save_to_file(sub_file, full_subs)
-    print(f"[+] Subdomains saved → {sub_file}")
+    print(Fore.CYAN + f"[+] Saved -> {sub_file}")
 
-    # Live check (main + all subs)
-    print("[*] Checking live status...")
-    domains_for_live = full_subs + [domain]
-    live_results = []
-
-    def check_live_with_status(sub):
-        for scheme in ["https", "http"]:
-            try:
-                url = f"{scheme}://{sub}"
-                resp = session.get(url, timeout=5)
-                if resp.status_code < 400:
-                    return f"{url} - {resp.status_code}"
-            except:
-                continue
-        return None
-
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        futures = [executor.submit(check_live_with_status, d) for d in domains_for_live]
-        for future in as_completed(futures):
-            r = future.result()
-            if r:
-                live_results.append(r)
-
+    print(Fore.CYAN + "[*] Probing live hosts ...")
+    live = probe_live_hosts(session, full_subs + [domain], threads)
     live_file = os.path.join(folder, f"{domain}_live_subdomains.txt")
-    save_to_file(live_file, live_results)
-    print(f"[+] Live subdomains saved → {live_file}")
+    with open(live_file, "w", encoding="utf-8") as f:
+        for url, code in sorted(live):
+            f.write(f"{url} - {code}\n")
+    print(Fore.CYAN + f"[+] Live hosts: {len(live)} -> {live_file}")
 
-    # Return clean live URLs for Phase 2
-    clean_live = [res.split(" - ")[0] for res in live_results]
-    return clean_live
+    return [url for url, _ in live]
 
-# ==================== MAIN ====================
-def main():
+
+# --------------------------------------------------------------------------- #
+# Target parsing
+# --------------------------------------------------------------------------- #
+def _read_targets_from_file(path: str) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f
+                    if line.strip() and not line.lstrip().startswith("#")]
+    except OSError:
+        print(Fore.RED + f"[!] Could not read file: {path}")
+        sys.exit(1)
+
+
+def _normalize_targets(raws: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for raw in raws:
+        d = sanitize_domain(raw)
+        if validate_domain(d):
+            out.append(d)
+        else:
+            print(Fore.RED + f"[!] Skipping invalid target: {raw}")
+    return list(dict.fromkeys(out))
+
+
+def _parse_targets(value: str) -> List[str]:
+    """Accept either a single domain/IP or a path to a file containing targets."""
+    if os.path.isfile(value):
+        return _normalize_targets(_read_targets_from_file(value))
+    return _normalize_targets([value])
+
+
+def _load_wordlist(path: Optional[str]) -> List[str]:
+    if not path:
+        return DEFAULT_WORDS[:]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            user_words = [line.strip() for line in f if line.strip()]
+    except OSError:
+        print(Fore.RED + f"[!] Wordlist '{path}' not found. Using built-in list.")
+        return DEFAULT_WORDS[:]
+    return list(dict.fromkeys(user_words + DEFAULT_WORDS))
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Handala.py - Ultimate Bug Bounty Tool (Subdomain Enum + Backup Finder)",
-        formatter_class=argparse.RawTextHelpFormatter
+        prog="exp.py",
+        description=(
+            "BackupFinder - subdomain enumeration + backup file discovery.\n"
+            "Use -sub for subdomain-only mode, -ld to skip straight to the "
+            "backup scan, or -t/-l for the full pipeline."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument('-t', '--target', help='Single target (domain or IP)')
-    group.add_argument('-l', '--list', help='File with domains/IPs → FULL scan (Phase 1+2)')
-    parser.add_argument('-ld', '--direct-list', help='File with domains/IPs → DIRECT backup scan ONLY (skip Phase 1)')
-    parser.add_argument('-w', '--wordlist', help='Custom wordlist (optional - uses strong built-in)')
+    group.add_argument("-t", "--target",
+                       help="Single target (domain or IP) - runs Phase 1 + Phase 2")
+    group.add_argument("-l", "--list",
+                       help="File with domains/IPs - runs Phase 1 + Phase 2")
+    group.add_argument("-ld", "--direct-list",
+                       help="File with live domains/IPs - direct backup scan only")
+    group.add_argument("-sub", "--subdomains",
+                       metavar="TARGET",
+                       help="Single domain OR a file of domains - SUBDOMAIN enum only")
 
+    parser.add_argument("-w", "--wordlist",
+                        help="Custom wordlist (merged with the strong built-in list)")
+    parser.add_argument("-T", "-threads", "--threads", type=int, default=50,
+                        dest="threads",
+                        help="Number of concurrent workers (default: 50)")
+    parser.add_argument("--timeout", type=float, default=8.0,
+                        help="Per-request timeout in seconds (default: 8)")
+    parser.add_argument("--max-depth", type=int, default=3,
+                        help="Recursive subdomain enumeration depth (default: 3)")
+    parser.add_argument("-o", "--output", default=".",
+                        help="Output directory for results (default: current dir)")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
-    if not (args.target or args.list or args.direct_list):
-        parser.error("Provide -t or -l or -ld")
+    if not (args.target or args.list or args.direct_list or args.subdomains):
+        parser.error("Provide one of: -t, -l, -ld, -sub")
 
-    # Wordlist (built-in is 10000x stronger than original)
-    if args.wordlist:
-        user_words = []
-        try:
-            with open(args.wordlist, "r", encoding="utf-8") as f:
-                user_words = [line.strip() for line in f if line.strip()]
-        except:
-            print(Fore.RED + f"[!] Wordlist not found, using built-in only")
-        all_words = list(set(user_words + DEFAULT_WORDS))
-    else:
-        all_words = DEFAULT_WORDS[:]
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
 
-    print(Fore.YELLOW + f"[*] Using {len(all_words)} backup words (strong BB list)")
+    session = build_session(pool_size=max(args.threads, 10), timeout=args.timeout)
+    os.makedirs(args.output, exist_ok=True)
 
-    # Load & sanitize targets
-    full_targets = []
+    # --------------------------------------------------------------- -sub mode
+    if args.subdomains:
+        targets = _parse_targets(args.subdomains)
+        if not targets:
+            print(Fore.RED + "[!] No valid targets.")
+            sys.exit(1)
+
+        print(Fore.YELLOW + "\n" + "=" * 60)
+        print("SUBDOMAIN ENUMERATION MODE (-sub)")
+        print("=" * 60)
+        for tgt in targets:
+            if is_ip_addr(tgt):
+                print(Fore.YELLOW + f"[!] {tgt} is an IP - skipping (nothing to enumerate).")
+                continue
+            do_subdomain_enum(session, tgt, threads=args.threads,
+                              output_dir=args.output, max_depth=args.max_depth)
+        print(Fore.GREEN + "\n[+] Subdomain scan complete.")
+        return
+
+    all_words = _load_wordlist(args.wordlist)
+    print(Fore.YELLOW + f"[*] Using {len(all_words)} backup words, "
+                       f"{len(BACKUP_EXTENSIONS)} extensions, "
+                       f"{args.threads} threads.")
+
+    full_targets: List[str] = []
     if args.target:
-        d = sanitize_domain(args.target)
-        if validate_domain(d) or is_ip_addr(d):
-            full_targets = [d]
-        else:
-            print(Fore.RED + f"[!] Invalid target {args.target}")
-            sys.exit(1)
+        full_targets = _normalize_targets([args.target])
     elif args.list:
-        raws = []
-        try:
-            with open(args.list, "r", encoding="utf-8") as f:
-                raws = [line.strip() for line in f if line.strip()]
-        except:
-            print(Fore.RED + f"[!] List file not found")
-            sys.exit(1)
-        for r in raws:
-            d = sanitize_domain(r)
-            if validate_domain(d) or is_ip_addr(d):
-                full_targets.append(d)
-            else:
-                print(Fore.RED + f"[!] Skipping invalid: {r}")
+        full_targets = _normalize_targets(_read_targets_from_file(args.list))
 
-    direct_targets = []
+    direct_targets: List[str] = []
     if args.direct_list:
-        raws = []
-        try:
-            with open(args.direct_list, "r", encoding="utf-8") as f:
-                raws = [line.strip() for line in f if line.strip()]
-        except:
-            print(Fore.RED + f"[!] Direct list file not found")
-            sys.exit(1)
-        for r in raws:
-            d = sanitize_domain(r)
-            if validate_domain(d) or is_ip_addr(d):
-                direct_targets.append(d)
-            else:
-                print(Fore.RED + f"[!] Skipping invalid: {r}")
+        direct_targets = _normalize_targets(_read_targets_from_file(args.direct_list))
 
     if not full_targets and not direct_targets:
         print(Fore.RED + "[!] No valid targets!")
         sys.exit(1)
 
-    # PHASE 1: Subdomain Enumeration
-    print(Fore.YELLOW + "\n" + "="*60)
+    # --------------------------------------------------------- Phase 1
+    print(Fore.YELLOW + "\n" + "=" * 60)
     print("PHASE 1: SUBDOMAIN ENUMERATION")
-    print("="*60 + "\n")
+    print("=" * 60)
 
-    all_live_urls = []
+    all_live_urls: List[str] = []
     for tgt in full_targets:
         if is_ip_addr(tgt):
-            print(Fore.YELLOW + f"[*] IP target {tgt} → skipping sub enum")
-            live = get_live_full_urls([tgt])
+            print(Fore.YELLOW + f"[*] IP target {tgt} -> skipping sub enum")
+            live = probe_live_hosts(session, [tgt], args.threads)
+            all_live_urls.extend(u for u, _ in live)
         else:
-            live = do_subdomain_enum(tgt)
-        all_live_urls.extend(live)
+            all_live_urls.extend(
+                do_subdomain_enum(session, tgt, threads=args.threads,
+                                  output_dir=args.output, max_depth=args.max_depth)
+            )
 
     if direct_targets:
-        print(Fore.YELLOW + f"[*] {len(direct_targets)} direct targets → backup only")
-        direct_live = get_live_full_urls(direct_targets)
-        all_live_urls.extend(direct_live)
+        print(Fore.YELLOW + f"[*] {len(direct_targets)} direct targets -> backup only")
+        direct_live = probe_live_hosts(session, direct_targets, args.threads)
+        all_live_urls.extend(u for u, _ in direct_live)
 
-    all_live_urls = list(dict.fromkeys(all_live_urls))  # dedup preserve order
-    print(Fore.GREEN + f"[+] Total live bases ready for backup scan: {len(all_live_urls)}")
+    all_live_urls = list(dict.fromkeys(all_live_urls))
+    print(Fore.GREEN + f"[+] Total live bases for backup scan: {len(all_live_urls)}")
 
-    # PHASE 2: Backup scanning
-    print(Fore.YELLOW + "\n" + "="*60)
-    print("PHASE 2: BACKUP FILE SCANNING (very fast)")
-    print("="*60 + "\n")
+    if not all_live_urls:
+        print(Fore.RED + "[!] No live hosts - nothing to scan for backups.")
+        return
 
-    for live_url in tqdm(all_live_urls, desc="Live domains", ncols=100):
-        process_backup_scan(live_url, all_words, BACKUP_EXTENSIONS)
+    # --------------------------------------------------------- Phase 2
+    print(Fore.YELLOW + "\n" + "=" * 60)
+    print("PHASE 2: BACKUP FILE SCANNING")
+    print("=" * 60)
 
-    # PHASE 3
-    print(Fore.GREEN + "\n" + "="*60)
+    for live_url in tqdm(all_live_urls, desc="Live hosts", ncols=100):
+        process_backup_scan(session, live_url, all_words, BACKUP_EXTENSIONS,
+                            threads=args.threads, output_dir=args.output)
+
+    # --------------------------------------------------------- Phase 3
+    print(Fore.GREEN + "\n" + "=" * 60)
     print("PHASE 3: DONE - All results saved!")
-    print("="*60)
+    print("=" * 60)
     print(Fore.GREEN + "[*] Files created:")
-    print("   • *_valid_backup_links.txt (per live host)")
-    print("   • domain_folder/{domain}_subdomains.txt")
-    print("   • domain_folder/{domain}_live_subdomains.txt")
-    print(Fore.GREEN + "[*] Tool optimized for CDNs, IPs, and real bug bounty speed.")
+    print(f"   - {args.output}/*_valid_backup_links.txt  (per live host)")
+    print(f"   - {args.output}/<domain>/<domain>_subdomains.txt")
+    print(f"   - {args.output}/<domain>/<domain>_live_subdomains.txt")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\n[!] Interrupted by user.")
+        sys.exit(130)
