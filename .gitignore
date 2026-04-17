@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.DS_Store
+
+# Scan artefacts
+*_valid_backup_links.txt
+*_subdomains.txt
+*_live_subdomains.txt
